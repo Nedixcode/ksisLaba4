@@ -2,12 +2,17 @@ package server;
 
 import blacklist.Blacklist;
 import http.HttpRequest;
+
 import java.io.*;
-import java.net.*;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
 
 public class ClientHandler implements Runnable {
+
+    private static final int SERVER_SOCKET_TIMEOUT_MS = 30_000;
+    private static final int BUFFER_SIZE = 8 * 1024;
 
     private final Socket clientSocket;
     private final Blacklist blacklist;
@@ -29,14 +34,8 @@ public class ClientHandler implements Runnable {
                 return;
             }
 
-            List<String> headers = new ArrayList<>();
-            String line;
-            while ((line = reader.readLine()) != null && !line.isEmpty()) {
-                headers.add(line);
-            }
-
+            List<String> headers = readHeaders(reader);
             HttpRequest httpRequest = HttpRequest.parse(requestLine, headers);
-
             if (httpRequest == null) {
                 return;
             }
@@ -52,17 +51,15 @@ public class ClientHandler implements Runnable {
             }
 
             try (Socket serverSocket = new Socket(host, port)) {
-                serverSocket.setSoTimeout(30000);
+                serverSocket.setSoTimeout(SERVER_SOCKET_TIMEOUT_MS);
 
                 OutputStream serverOut = serverSocket.getOutputStream();
                 InputStream serverIn = serverSocket.getInputStream();
 
                 sendRequestToServer(httpRequest, serverOut, reader);
-
                 forwardResponse(serverIn, clientOut, fullUrl);
 
             } catch (IOException e) {
-                System.err.println("Ошибка при соединении с сервером назначения: " + e.getMessage());
             }
 
         } catch (IOException e) {
@@ -75,13 +72,21 @@ public class ClientHandler implements Runnable {
         }
     }
 
+    private List<String> readHeaders(BufferedReader reader) throws IOException {
+        List<String> headers = new ArrayList<>();
+        String line;
+        while ((line = reader.readLine()) != null && !line.isEmpty()) {
+            headers.add(line);
+        }
+        return headers;
+    }
+
     private void sendRequestToServer(HttpRequest request,
                                      OutputStream serverOut,
                                      BufferedReader clientReader) throws IOException {
         PrintWriter serverWriter = new PrintWriter(new OutputStreamWriter(serverOut), false);
 
         serverWriter.print(request.getMethod() + " " + request.getPath() + " " + request.getHttpVersion() + "\r\n");
-
         for (String header : request.getHeaders()) {
             serverWriter.print(header + "\r\n");
         }
@@ -94,7 +99,9 @@ public class ClientHandler implements Runnable {
             int read = 0;
             while (read < contentLength) {
                 int r = clientReader.read(body, read, contentLength - read);
-                if (r == -1) break;
+                if (r == -1) {
+                    break;
+                }
                 read += r;
             }
             serverWriter.print(body);
@@ -107,7 +114,8 @@ public class ClientHandler implements Runnable {
         BufferedOutputStream bos = new BufferedOutputStream(clientOut);
 
         ByteArrayOutputStream headerBuffer = new ByteArrayOutputStream();
-        int prev = -1, cur;
+        int prev = -1;
+        int cur;
         boolean headersEnded = false;
 
         while ((cur = bis.read()) != -1) {
@@ -132,27 +140,16 @@ public class ClientHandler implements Runnable {
         }
 
         byte[] headerBytes = headerBuffer.toByteArray();
-        String headerText = new String(headerBytes);
+        String headerText = new String(headerBytes, StandardCharsets.ISO_8859_1);
         String[] headerLines = headerText.split("\r\n");
 
-        int statusCode = 0;
-        if (headerLines.length > 0) {
-            String statusLine = headerLines[0];
-            String[] parts = statusLine.split(" ");
-            if (parts.length >= 2) {
-                try {
-                    statusCode = Integer.parseInt(parts[1]);
-                } catch (NumberFormatException ignored) {
-                }
-            }
-        }
-
+        int statusCode = parseStatusCode(headerLines);
         log(url, statusCode);
 
         bos.write(headerBytes);
         bos.flush();
 
-        byte[] buffer = new byte[8192];
+        byte[] buffer = new byte[BUFFER_SIZE];
         int read;
         while ((read = bis.read(buffer)) != -1) {
             bos.write(buffer, 0, read);
@@ -160,19 +157,38 @@ public class ClientHandler implements Runnable {
         }
     }
 
+    private int parseStatusCode(String[] headerLines) {
+        if (headerLines.length == 0) {
+            return 0;
+        }
+        String statusLine = headerLines[0];
+        String[] parts = statusLine.split(" ");
+        if (parts.length >= 2) {
+            try {
+                return Integer.parseInt(parts[1]);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 0;
+    }
+
     private void sendBlockedResponse(OutputStream clientOut, String url) throws IOException {
-        PrintWriter writer = new PrintWriter(new OutputStreamWriter(clientOut), false);
+        PrintWriter writer = new PrintWriter(new OutputStreamWriter(clientOut, StandardCharsets.UTF_8), false);
         String body = "<html><body><h2>Доступ к ресурсу заблокирован</h2>" +
                 "<p>URL: " + url + "</p>" +
                 "</body></html>";
 
+        byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
+
         writer.print("HTTP/1.1 403 Forbidden\r\n");
         writer.print("Content-Type: text/html; charset=UTF-8\r\n");
-        writer.print("Content-Length: " + body.getBytes(StandardCharsets.UTF_8).length + "\r\n");
+        writer.print("Content-Length: " + bodyBytes.length + "\r\n");
         writer.print("Connection: close\r\n");
         writer.print("\r\n");
-        writer.print(body);
         writer.flush();
+
+        clientOut.write(bodyBytes);
+        clientOut.flush();
     }
 
     private void log(String url, int statusCode) {
